@@ -36,3 +36,4 @@ cortex-m-rt = "0.7.5"
 
 # Panic handler that exits `probe-run` with an error code
 panic-probe = { version = "1.0.0", features = ["print-defmt"] }
+libm = "0.2.16"
