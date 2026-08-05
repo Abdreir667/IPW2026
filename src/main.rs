@@ -30,21 +30,6 @@ use mipidsi::{
     options::{Orientation, Rotation},
 };
 
-
-const REG_ADDR:u8 = 0x3B;
-const WRITE_ADDR_PWR:u8 = 0x6B;
-const WRITE_CONFIG:u8 = 0x1C;
-const SCALE_F: u16 = 16_384;
-const G: f32 = 9.80665;
-
-fn combine_bytes(first: u8, second: u8) -> i16 {
-    let mut res: i16;
-    res = first as i16;
-    res <<= 8;
-    res |= second as i16;
-    res
-}
-
 use panic_probe as _;
 
 fn trans_to_disp(angle : f32) -> &'static str {
