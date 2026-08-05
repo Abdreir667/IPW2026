@@ -39,3 +39,5 @@ panic-probe = { version = "1.0.0", features = ["print-defmt"] }
 embedded-graphics = "0.8.2"
 heapless = "0.9.3"
 mipidsi = "0.10.0"
+libm = "0.2.16"
+embedded-hal = "1.0.0"
