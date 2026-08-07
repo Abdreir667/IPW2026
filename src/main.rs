@@ -192,7 +192,7 @@ async fn main(_spawner: Spawner) {
     let mut yaw: f32 = 0.0;
     let mut last_time = Instant::now();
 
-    ch1.set_duty_cycle_fraction(min_value as u16, 1000);
+    ch1.set_duty_cycle_fraction((min_value + 50) as u16, 1000);
 
     loop {
         // Read 14 consecutive bytes starting at 0x3B:
@@ -263,12 +263,17 @@ async fn main(_spawner: Spawner) {
             .draw(&mut screen)
             .unwrap();
 
-        // Timer::after_millis(50).await;
-
+        // Timer::after_millis(50).await;;
         if fabs(old_yaw as f64 - yaw as f64) > 3.0 {
-            ch1.set_duty_cycle_fraction(transform(yaw) as u16, 1000);
-            info!("Ma misc {}", yaw);
+            info!("{}\n", transform(yaw));
+            if yaw > 0.0 {
+                ch1.set_duty_cycle_fraction(max_value as u16, 1000);
+                info!("Ma misc dreapta");
+            } else {
+                ch1.set_duty_cycle_fraction(min_value as u16, 1000);
+                info!("Stanga");
+            }
         }
-        Timer::after_millis(100).await;
+        Timer::after_millis(1000).await;
     }
 }
