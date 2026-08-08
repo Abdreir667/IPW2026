@@ -36,8 +36,8 @@ cortex-m-rt = "0.7.5"
 
 # Panic handler that exits `probe-run` with an error code
 panic-probe = { version = "1.0.0", features = ["print-defmt"] }
-libm = "0.2.16"
-heapless = "0.9.3"
 embedded-graphics = "0.8.2"
+heapless = "0.9.3"
 mipidsi = "0.10.0"
+libm = "0.2.16"
 embedded-hal = "1.0.0"
