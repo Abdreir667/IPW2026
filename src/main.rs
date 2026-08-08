@@ -296,9 +296,13 @@ pitch = atan2f(acc_y, sqrtf(acc_x * acc_x + acc_z * acc_z)).to_degrees();
             CHANNEL.send(-yaw).await; // Yields to move_motor
         }
 
-        let value = BUT.receive().await;
-        if value == true {
-            info!("huhu");
+        let value = BUT.try_receive();
+        match value {
+            Ok(_v) => {
+                yaw = 0.0;
+                info!("Neutralize\n\n\n\n");
+            }
+            _ => {}
         }
     }
 }
