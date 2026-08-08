@@ -2,6 +2,10 @@
 #![no_main]
 
 use core::{cell::RefCell, fmt::Write};
+use embassy_stm32::exti::ExtiInput;
+use embassy_stm32::gpio::Pull;
+use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
+use embassy_sync::channel::Channel;
 use embedded_graphics::text::renderer::CharacterStyle;
 use libm::*;
 
@@ -9,14 +13,13 @@ use defmt::{debug, info};
 use defmt_rtt as _;
 use embassy_embedded_hal::shared_bus::blocking::spi::SpiDeviceWithConfig;
 use embassy_executor::Spawner;
-use embassy_stm32::timer::simple_pwm::PwmPin;
+use embassy_stm32::timer::simple_pwm::{PwmPin, SimplePwm};
 use embassy_stm32::{
     Config,
     gpio::{Level, Output, OutputType, Speed},
     rcc::{Pll, PllDiv, PllMul, PllPreDiv, PllSource, Sysclk, VoltageScale, mux},
     spi::{self, Spi},
     time::{self, Hertz},
-    timer::simple_pwm::SimplePwm,
 };
 use embassy_sync::blocking_mutex::{Mutex, raw::NoopRawMutex};
 use embassy_time::{Delay, Instant, Timer};
@@ -43,8 +46,54 @@ const WRITE_CONFIG: u8 = 0x1C;
 const SCALE_F: f32 = 16384.0;
 const GYRO_SCALE: f32 = 131.0; // 131 LSB per deg/s (for +/- 250 dps full scale range)
 
+static CHANNEL: Channel<ThreadModeRawMutex, f32, 64> = Channel::new();
+static BUT: Channel<ThreadModeRawMutex, bool, 64> = Channel::new();
+
 fn combine_bytes(first: u8, second: u8) -> i16 {
     ((first as i16) << 8) | (second as i16)
+}
+
+fn display(
+    roll: f32,
+    pitch: f32,
+    yaw: f32,
+    screen: &mut impl DrawTarget<Color = Rgb565>,
+    style: MonoTextStyle<'_, Rgb565>,
+) {
+    let mut acceleration_buf = heapless::String::<120>::new();
+    core::write!(
+        &mut acceleration_buf,
+        "Roll:\n [{}]\n\nPitch:\n [{}]\n\nYaw:\n [{}]",
+        trans_to_disp(-roll),
+        trans_to_disp(pitch),
+        trans_to_disp(-yaw)
+    )
+    .unwrap();
+
+    let _ = Text::new(&acceleration_buf, Point::new(0, 20), style).draw(screen);
+}
+
+#[embassy_executor::task]
+async fn reset_btn(mut btn:ExtiInput<'static>) {
+    loop {
+        btn.wait_for_falling_edge().await;
+        BUT.send(true).await;
+        // Timer::after_millis(50).await;
+
+    }
+}
+
+
+#[embassy_executor::task]
+async fn move_motor(_old_yaw: f64, mut pwm: SimplePwm<'static, embassy_stm32::peripherals::TIM1>) {
+    
+    let mut ch1 = pwm.ch1();
+    ch1.enable();
+    loop {
+        let yaw = CHANNEL.receive().await;
+        ch1.set_duty_cycle_fraction(transform(yaw) as u16, 10_000);
+        info!("Ma misc {}", yaw);
+    }
 }
 
 fn trans_to_disp(angle: f32) -> &'static str {
@@ -90,7 +139,7 @@ fn transform(x: f32) -> f32 {
 }
 
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     let mut config = Config::default();
     // let p = embassy_stm32::init(config);
 
@@ -111,7 +160,11 @@ async fn main(_spawner: Spawner) {
 
     let p = embassy_stm32::init(config);
 
+    let mut warning_pin = Output::new(p.PB6, Level::Low, Speed::Medium);
+    let mut good_pin = Output::new(p.PB7, Level::High, Speed::Medium);
     let pwm_pin = PwmPin::new(p.PA8, OutputType::PushPull);
+
+    let mut il_butoaine = ExtiInput::new(p.PA3, p.EXTI3, Pull::None);
 
     let mut pwm = SimplePwm::new(
         p.TIM1,
@@ -123,15 +176,16 @@ async fn main(_spawner: Spawner) {
         Default::default(),
     );
 
-    let mut ch1 = pwm.ch1();
-    ch1.enable();
+    spawner.spawn(move_motor(0.0, pwm)).unwrap();
+    spawner.spawn(reset_btn(il_butoaine)).unwrap();
 
     const MIN_PERIOD_US: u32 = 500;
     const MAX_PERIOD_US: u32 = 2500;
     const PERIOD_US: u32 = 20000;
 
-    let min_value = (MIN_PERIOD_US * 1000) / PERIOD_US;
-    let max_value = (MAX_PERIOD_US * 1000) / PERIOD_US; // 1250
+    let mut roll: f32 = 0.0;
+    let mut yaw: f32 = 0.0;
+    let mut pitch: f32 = 0.0;
 
     info!("Device started");
 
@@ -187,36 +241,34 @@ async fn main(_spawner: Spawner) {
     }
     let gyro_z_offset = gyro_z_sum / (samples as f32);
     info!("Gyro Z bias offset: {}", gyro_z_offset);
-
+    Timer::after_secs(1).await;
+    warning_pin.set_high();
+    good_pin.set_low();
     // --- STEP 2: STATE VARIABLES ---
     let mut yaw: f32 = 0.0;
     let mut last_time = Instant::now();
 
-    ch1.set_duty_cycle_fraction((min_value + 50) as u16, 1000);
+
+    // Timer::after_secs(1).await;
+    let mut last_display_time = Instant::now();
 
     loop {
+        let now = Instant::now();
+        
+        // Only update the display every 200ms (5 frames per second)
+        if now.duration_since(last_display_time).as_millis() > 500 {
+            display(roll, pitch, yaw, &mut screen, style);
+            last_display_time = now;
+        }
+
+        // --- SPI Sensor Read ---
+        let tx_buf = [ (1 << 7) | REG_ADDR, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 ];
+        let mut rx_buf = [0u8; 15];
+        sensor_spi.transfer(&mut rx_buf, &tx_buf).unwrap();
         // Read 14 consecutive bytes starting at 0x3B:
         // Accel X (1,2), Accel Y (3,4), Accel Z (5,6), Temp (7,8),
         // Gyro X (9,10), Gyro Y (11,12), Gyro Z (13,14)
-        let tx_buf = [
-            (1 << 7) | REG_ADDR,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ];
-        let mut rx_buf = [0u8; 15];
-        sensor_spi.transfer(&mut rx_buf, &tx_buf).unwrap();
+
 
         let res_x = combine_bytes(rx_buf[1], rx_buf[2]);
         let res_y = combine_bytes(rx_buf[3], rx_buf[4]);
@@ -227,53 +279,26 @@ async fn main(_spawner: Spawner) {
         let acc_y = (res_y as f32) / SCALE_F;
         let acc_z = (res_z as f32) / SCALE_F;
 
-        let pitch = atan2f(acc_y, sqrtf(acc_x * acc_x + acc_z * acc_z)).to_degrees();
-        let roll = atan2f(-acc_x, sqrtf(acc_y * acc_y + acc_z * acc_z)).to_degrees();
+pitch = atan2f(acc_y, sqrtf(acc_x * acc_x + acc_z * acc_z)).to_degrees();
+        roll = atan2f(-acc_x, sqrtf(acc_y * acc_y + acc_z * acc_z)).to_degrees();
 
-        // --- STEP 3: TIME DELTA & INTEGRATION ---
-        let now = Instant::now();
         let delta_t = now.duration_since(last_time).as_micros() as f32 / 1_000_000.0;
         last_time = now;
 
-        // Convert raw gyro reading to deg/sec minus calibrated bias
         let gyro_z_dps = ((raw_gz as f32) - gyro_z_offset) / GYRO_SCALE;
+        let filtered_gz = if gyro_z_dps.abs() < 0.3 { 0.0 } else { gyro_z_dps };
 
-        // Apply deadband (ignore micro noise below 0.3 dps to reduce drift)
-        let filtered_gz = if gyro_z_dps.abs() < 0.3 {
-            0.0
-        } else {
-            gyro_z_dps
-        };
-
-        // Integrate rate over time
         let old_yaw = yaw;
         yaw += filtered_gz * delta_t;
 
-        let mut acceleration_buf = heapless::String::<120>::new();
-        core::write!(
-            &mut acceleration_buf,
-            "Roll:\n [{}]\n\nPitch:\n [{}]\n\nYaw:\n [{}]",
-            trans_to_disp(-roll),
-            trans_to_disp(pitch),
-            trans_to_disp(-yaw)
-        )
-        .unwrap();
-
-        Text::new(&acceleration_buf, Point::new(0, 20), style)
-            .draw(&mut screen)
-            .unwrap();
-
-        // Timer::after_millis(50).await;;
-        if fabs(old_yaw as f64 - yaw as f64) > 3.0 {
-            info!("{}\n", transform(yaw));
-            if yaw > 0.0 {
-                ch1.set_duty_cycle_fraction(max_value as u16, 1000);
-                info!("Ma misc dreapta");
-            } else {
-                ch1.set_duty_cycle_fraction(min_value as u16, 1000);
-                info!("Stanga");
-            }
+        // Use absolute value to ignore massive noisy spikes, but allow normal movement
+        if (yaw - old_yaw).abs() < 1.0 {
+            CHANNEL.send(-yaw).await; // Yields to move_motor
         }
-        Timer::after_millis(1000).await;
+
+        let value = BUT.receive().await;
+        if value == true {
+            info!("huhu");
+        }
     }
 }
