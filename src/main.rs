@@ -77,7 +77,7 @@ async fn move_motor(_old_yaw: f64, mut pwm: SimplePwm<'static, embassy_stm32::pe
     ch1.enable();
     loop {
         let yaw = CHANNEL.receive().await;
-        ch1.set_duty_cycle_fraction(transform(yaw) as u16, 10000);
+        ch1.set_duty_cycle_fraction(transform(yaw) as u16, 10_000);
         info!("Ma misc {}", yaw);
     }
 }
@@ -158,14 +158,6 @@ async fn main(spawner: Spawner) {
         Default::default(),
     );
 
-    let mut ch1 = pwm.ch1();
-
-    let min_value = (MIN_PERIOD_US * 1000) / PERIOD_US;
-    let max_value = (MAX_PERIOD_US * 1000) / PERIOD_US; // 1250
-
-    ch1.set_duty_cycle_fraction(750 , 1000);
-    Timer::after_millis(50).await;
-
     spawner.spawn(move_motor(0.0, pwm)).unwrap();
 
     const MIN_PERIOD_US: u32 = 500;
@@ -237,31 +229,25 @@ async fn main(spawner: Spawner) {
 
 
     // Timer::after_secs(1).await;
+    let mut last_display_time = Instant::now();
 
     loop {
-        display(roll, pitch, yaw, &mut screen, style);
+        let now = Instant::now();
+        
+        // Only update the display every 200ms (5 frames per second)
+        if now.duration_since(last_display_time).as_millis() > 500 {
+            display(roll, pitch, yaw, &mut screen, style);
+            last_display_time = now;
+        }
+
+        // --- SPI Sensor Read ---
+        let tx_buf = [ (1 << 7) | REG_ADDR, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 ];
+        let mut rx_buf = [0u8; 15];
+        sensor_spi.transfer(&mut rx_buf, &tx_buf).unwrap();
         // Read 14 consecutive bytes starting at 0x3B:
         // Accel X (1,2), Accel Y (3,4), Accel Z (5,6), Temp (7,8),
         // Gyro X (9,10), Gyro Y (11,12), Gyro Z (13,14)
-        let tx_buf = [
-            (1 << 7) | REG_ADDR,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ];
-        let mut rx_buf = [0u8; 15];
-        sensor_spi.transfer(&mut rx_buf, &tx_buf).unwrap();
+
 
         let res_x = combine_bytes(rx_buf[1], rx_buf[2]);
         let res_y = combine_bytes(rx_buf[3], rx_buf[4]);
@@ -272,30 +258,21 @@ async fn main(spawner: Spawner) {
         let acc_y = (res_y as f32) / SCALE_F;
         let acc_z = (res_z as f32) / SCALE_F;
 
-        pitch = atan2f(acc_y, sqrtf(acc_x * acc_x + acc_z * acc_z)).to_degrees();
+pitch = atan2f(acc_y, sqrtf(acc_x * acc_x + acc_z * acc_z)).to_degrees();
         roll = atan2f(-acc_x, sqrtf(acc_y * acc_y + acc_z * acc_z)).to_degrees();
 
-        // --- STEP 3: TIME DELTA & INTEGRATION ---
-        let now = Instant::now();
         let delta_t = now.duration_since(last_time).as_micros() as f32 / 1_000_000.0;
         last_time = now;
 
-        // Convert raw gyro reading to deg/sec minus calibrated bias
         let gyro_z_dps = ((raw_gz as f32) - gyro_z_offset) / GYRO_SCALE;
+        let filtered_gz = if gyro_z_dps.abs() < 0.3 { 0.0 } else { gyro_z_dps };
 
-        // Apply deadband (ignore micro noise below 0.3 dps to reduce drift)
-        let filtered_gz = if gyro_z_dps.abs() < 0.3 {
-            0.0
-        } else {
-            gyro_z_dps
-        };
-
-        // Integrate rate over time
         let old_yaw = yaw;
         yaw += filtered_gz * delta_t;
 
-        if yaw - old_yaw < 1.0{
-            CHANNEL.send(-yaw).await;
+        // Use absolute value to ignore massive noisy spikes, but allow normal movement
+        if (yaw - old_yaw).abs() < 1.0 {
+            CHANNEL.send(-yaw).await; // Yields to move_motor
         }
 
         // Timer::after_millis(50).await;
