@@ -2,12 +2,14 @@
 #![no_main]
 
 use core::{cell::RefCell, fmt::Write};
+use embassy_stm32::adc;
 use embassy_stm32::exti::ExtiInput;
 use embassy_stm32::gpio::Pull;
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::channel::Channel;
 use embedded_graphics::text::renderer::CharacterStyle;
 use libm::*;
+
 
 use defmt::{debug, info};
 use defmt_rtt as _;
@@ -47,7 +49,9 @@ const SCALE_F: f32 = 16384.0;
 const GYRO_SCALE: f32 = 131.0; // 131 LSB per deg/s (for +/- 250 dps full scale range)
 
 static CHANNEL: Channel<ThreadModeRawMutex, f32, 64> = Channel::new();
+static CHANNEL2: Channel<ThreadModeRawMutex, f32, 64> = Channel::new();
 static BUT: Channel<ThreadModeRawMutex, bool, 64> = Channel::new();
+static JOYSTICK: Channel<ThreadModeRawMutex, f32, 64> = Channel::new();
 
 fn combine_bytes(first: u8, second: u8) -> i16 {
     ((first as i16) << 8) | (second as i16)
@@ -84,6 +88,39 @@ async fn reset_btn(mut btn:ExtiInput<'static>) {
 }
 
 
+use embassy_stm32::Peri;
+use embassy_stm32::peripherals::{ADC1, PA0};
+
+#[embassy_executor::task]
+async fn control_joystick(
+    mut adc: adc::Adc<'static, ADC1>,
+    mut pa_pin: Peri<'static, PA0>,
+) {
+    adc.set_resolution(adc::Resolution::BITS14);
+    adc.set_averaging(adc::Averaging::Samples1024);
+    adc.set_sample_time(adc::SampleTime::CYCLES160_5);
+
+    let zero = 8192.0;
+    let step1 = 12287.0;
+    let step_1 = 4095.0;
+    Timer::after_millis(200).await;
+
+    const MAX_VALUE: u32 = adc::resolution_to_max_count(adc::Resolution::BITS14);
+    loop {
+        let level: f64 = adc.blocking_read(&mut pa_pin) as f64;
+        let voltage = 3.3f32 * level as f32 / MAX_VALUE as f32;
+        // info!("{} {}", level, voltage);
+
+        if level < 1000.0 {
+            JOYSTICK.send(1.0).await;
+        } else if level > 6000.0 && level < 10000.0{
+            JOYSTICK.send(-1.0).await;
+        }
+        Timer::after_millis(100).await;
+    }
+}
+
+
 #[embassy_executor::task]
 async fn move_motor(_old_yaw: f64, mut pwm: SimplePwm<'static, embassy_stm32::peripherals::TIM1>) {
     
@@ -91,6 +128,17 @@ async fn move_motor(_old_yaw: f64, mut pwm: SimplePwm<'static, embassy_stm32::pe
     ch1.enable();
     loop {
         let yaw = CHANNEL.receive().await;
+        ch1.set_duty_cycle_fraction(transform(yaw) as u16, 10_000);
+        info!("Ma misc {}", yaw);
+    }
+}
+
+async fn move_motor2(_old_yaw2: f64, mut pwm: SimplePwm<'static, embassy_stm32::peripherals::TIM2>) {
+    
+    let mut ch1 = pwm.ch1();
+    ch1.enable();
+    loop {
+        let yaw = CHANNEL2.receive().await;
         ch1.set_duty_cycle_fraction(transform(yaw) as u16, 10_000);
         info!("Ma misc {}", yaw);
     }
@@ -176,8 +224,22 @@ async fn main(spawner: Spawner) {
         Default::default(),
     );
 
+    let pwm_pin2 = PwmPin::new(p.PC7, OutputType::PushPull);
+
+    let mut pwm2 = SimplePwm::new(
+        p.TIM3,
+        None,
+        Some(pwm_pin2),
+        None,
+        None,
+        time::hz(50),
+        Default::default(),
+    );
+
     spawner.spawn(move_motor(0.0, pwm)).unwrap();
+    spawner.spawn(move_motor2(0.0, pwm2)).unwrap();
     spawner.spawn(reset_btn(il_butoaine)).unwrap();
+    spawner.spawn(control_joystick(adc::Adc::new(p.ADC1), p.PA0)).unwrap();
 
     const MIN_PERIOD_US: u32 = 500;
     const MAX_PERIOD_US: u32 = 2500;
@@ -247,12 +309,15 @@ async fn main(spawner: Spawner) {
     // --- STEP 2: STATE VARIABLES ---
     let mut yaw: f32 = 0.0;
     let mut last_time = Instant::now();
-
+    let old_roll = 0.0;
 
     // Timer::after_secs(1).await;
     let mut last_display_time = Instant::now();
 
     loop {
+
+        // Wait a bit before reading again
+        // embassy_time::Timer::after_secs(1).await;
         let now = Instant::now();
         
         // Only update the display every 200ms (5 frames per second)
@@ -279,7 +344,8 @@ async fn main(spawner: Spawner) {
         let acc_y = (res_y as f32) / SCALE_F;
         let acc_z = (res_z as f32) / SCALE_F;
 
-pitch = atan2f(acc_y, sqrtf(acc_x * acc_x + acc_z * acc_z)).to_degrees();
+    
+        pitch = atan2f(acc_y, sqrtf(acc_x * acc_x + acc_z * acc_z)).to_degrees();
         roll = atan2f(-acc_x, sqrtf(acc_y * acc_y + acc_z * acc_z)).to_degrees();
 
         let delta_t = now.duration_since(last_time).as_micros() as f32 / 1_000_000.0;
@@ -296,6 +362,10 @@ pitch = atan2f(acc_y, sqrtf(acc_x * acc_x + acc_z * acc_z)).to_degrees();
             CHANNEL.send(-yaw).await; // Yields to move_motor
         }
 
+        if (roll - old_roll).abs() < 1.0 {
+            CHANNEL2.send(-roll).await; // Yields to move_motor
+        }
+
         let value = BUT.try_receive();
         match value {
             Ok(_v) => {
@@ -304,5 +374,17 @@ pitch = atan2f(acc_y, sqrtf(acc_x * acc_x + acc_z * acc_z)).to_degrees();
             }
             _ => {}
         }
+
+        
+
+        let val = JOYSTICK.try_receive();
+        match val {
+            Ok(v) => {
+                yaw += 5.0 * v;
+            }
+            Err(_) => {}
+        }
+
+        old_roll = roll;
     }
 }
