@@ -49,8 +49,10 @@ const SCALE_F: f32 = 16384.0;
 const GYRO_SCALE: f32 = 131.0; // 131 LSB per deg/s (for +/- 250 dps full scale range)
 
 static CHANNEL: Channel<ThreadModeRawMutex, f32, 64> = Channel::new();
+static CHANNEL2: Channel<ThreadModeRawMutex, f32, 64> = Channel::new();
 static BUT: Channel<ThreadModeRawMutex, bool, 64> = Channel::new();
 static JOYSTICK: Channel<ThreadModeRawMutex, f32, 64> = Channel::new();
+static JOYSTICK2: Channel<ThreadModeRawMutex, f32, 64> = Channel::new();
 
 fn combine_bytes(first: u8, second: u8) -> i16 {
     ((first as i16) << 8) | (second as i16)
@@ -88,12 +90,14 @@ async fn reset_btn(mut btn:ExtiInput<'static>) {
 
 
 use embassy_stm32::Peri;
-use embassy_stm32::peripherals::{ADC1, PA0};
+use embassy_stm32::peripherals::{ADC1, PA0, PA4};
 
 #[embassy_executor::task]
 async fn control_joystick(
     mut adc: adc::Adc<'static, ADC1>,
-    mut pa_pin: Peri<'static, PA0>,
+    mut pa_pin_x: Peri<'static, PA0>,
+    mut pa_pin_y: Peri<'static, PA4>,
+
 ) {
     adc.set_resolution(adc::Resolution::BITS14);
     adc.set_averaging(adc::Averaging::Samples1024);
@@ -106,16 +110,29 @@ async fn control_joystick(
 
     const MAX_VALUE: u32 = adc::resolution_to_max_count(adc::Resolution::BITS14);
     loop {
-        let level: f64 = adc.blocking_read(&mut pa_pin) as f64;
-        let voltage = 3.3f32 * level as f32 / MAX_VALUE as f32;
+        let level_x: f64 = adc.blocking_read(&mut pa_pin_x) as f64;
+        // let voltage = 3.3f32 * level as f32 / MAX_VALUE as f32;
         // info!("{} {}", level, voltage);
+        let level_y: f64 = adc.blocking_read(&mut pa_pin_y) as f64;
+        info!("Level x: {} Level y {}", level_x, level_y);
 
-        if level < 1000.0 {
+        if level_x < 1000.0 {
             JOYSTICK.send(1.0).await;
-        } else if level > 6000.0 && level < 10000.0{
+        } else if level_x > 6000.0 && level_x < 10000.0{
             JOYSTICK.send(-1.0).await;
         }
-        Timer::after_millis(100).await;
+
+        Timer::after_millis(10).await;
+
+        if level_y < 4000.0 {
+            JOYSTICK2.send(1.0).await;
+        } else if level_y > 6000.0 && level_y < 14000.0{
+            JOYSTICK2.send(-1.0).await;
+        }
+
+        Timer::after_millis(200).await;
+
+
     }
 }
 
@@ -128,7 +145,19 @@ async fn move_motor(_old_yaw: f64, mut pwm: SimplePwm<'static, embassy_stm32::pe
     loop {
         let yaw = CHANNEL.receive().await;
         ch1.set_duty_cycle_fraction(transform(yaw) as u16, 10_000);
-        info!("Ma misc {}", yaw);
+        // info!("Ma misc yaw {}", yaw);
+    }
+}
+
+#[embassy_executor::task]
+async fn move_motor2(_old_yaw2: f64, mut pwm: SimplePwm<'static, embassy_stm32::peripherals::TIM3>) {
+    
+    let mut ch1 = pwm.ch2();
+    ch1.enable();
+    loop {
+        let yaw = CHANNEL2.receive().await;
+        ch1.set_duty_cycle_fraction(transform(yaw) as u16, 10_000);
+        // info!("Ma misc roll {}", yaw);
     }
 }
 
@@ -212,9 +241,22 @@ async fn main(spawner: Spawner) {
         Default::default(),
     );
 
+    let pwm_pin2 = PwmPin::new(p.PC7, OutputType::PushPull);
+
+    let mut pwm2 = SimplePwm::new(
+        p.TIM3,
+        None,
+        Some(pwm_pin2),
+        None,
+        None,
+        time::hz(50),
+        Default::default(),
+    );
+
     spawner.spawn(move_motor(0.0, pwm)).unwrap();
+    spawner.spawn(move_motor2(0.0, pwm2)).unwrap();
     spawner.spawn(reset_btn(il_butoaine)).unwrap();
-    spawner.spawn(control_joystick(adc::Adc::new(p.ADC1), p.PA0)).unwrap();
+    spawner.spawn(control_joystick(adc::Adc::new(p.ADC1), p.PA0, p.PA4)).unwrap();
 
     const MIN_PERIOD_US: u32 = 500;
     const MAX_PERIOD_US: u32 = 2500;
@@ -254,6 +296,11 @@ async fn main(spawner: Spawner) {
     let mut style = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
     style.set_background_color(Some(Rgb565::BLACK));
 
+    let mut rx_dummy = [0x00u8; 2];
+    let tx_reset = [!(1 << 7) & WRITE_ADDR_PWR, 0x80]; // 0x80 = Device Reset bit
+    sensor_spi.transfer(&mut rx_dummy, &tx_reset).unwrap();
+    Timer::after_millis(100).await; // Wait for reset to finish
+
     // MPU Init
     let tx_pwr = [!(1 << 7) & WRITE_ADDR_PWR, 0x00];
     let mut rx_dummy = [0u8; 2];
@@ -284,7 +331,8 @@ async fn main(spawner: Spawner) {
     // --- STEP 2: STATE VARIABLES ---
     let mut yaw: f32 = 0.0;
     let mut last_time = Instant::now();
-
+    let mut old_roll = 0.0;
+    let mut rolly = 0.0;
 
     // Timer::after_secs(1).await;
     let mut last_display_time = Instant::now();
@@ -296,8 +344,9 @@ async fn main(spawner: Spawner) {
         let now = Instant::now();
         
         // Only update the display every 200ms (5 frames per second)
-        if now.duration_since(last_display_time).as_millis() > 500 {
+        if now.duration_since(last_display_time).as_millis() > 1000 {
             display(roll, pitch, yaw, &mut screen, style);
+            CHANNEL2.send(roll).await; // Yields to move_motor
             last_display_time = now;
         }
 
@@ -319,9 +368,10 @@ async fn main(spawner: Spawner) {
         let acc_y = (res_y as f32) / SCALE_F;
         let acc_z = (res_z as f32) / SCALE_F;
 
+    
         pitch = atan2f(acc_y, sqrtf(acc_x * acc_x + acc_z * acc_z)).to_degrees();
         roll = atan2f(-acc_x, sqrtf(acc_y * acc_y + acc_z * acc_z)).to_degrees();
-
+        roll += rolly;
         let delta_t = now.duration_since(last_time).as_micros() as f32 / 1_000_000.0;
         last_time = now;
 
@@ -332,18 +382,25 @@ async fn main(spawner: Spawner) {
         yaw += filtered_gz * delta_t;
 
         // Use absolute value to ignore massive noisy spikes, but allow normal movement
-        if (yaw - old_yaw).abs() < 1.0 {
+        if (yaw - old_yaw).abs() < 2.0 {
             CHANNEL.send(-yaw).await; // Yields to move_motor
+        }
+
+        if (roll - old_roll).abs() < 2.0 {
+            CHANNEL2.send(roll).await; // Yields to move_motor
         }
 
         let value = BUT.try_receive();
         match value {
             Ok(_v) => {
                 yaw = 0.0;
+                rolly = 0.0;
                 info!("Neutralize\n\n\n\n");
             }
             _ => {}
         }
+
+        
 
         let val = JOYSTICK.try_receive();
         match val {
@@ -352,5 +409,16 @@ async fn main(spawner: Spawner) {
             }
             Err(_) => {}
         }
+
+        let val2 = JOYSTICK2.try_receive();
+        match val2 {
+            Ok(v) => {
+                rolly += 5.0 * v;
+            }
+            Err(_) => {}
+        }
+
+
+        old_roll = roll;
     }
 }
