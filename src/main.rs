@@ -2,13 +2,14 @@
 #![no_main]
 
 use core::{cell::RefCell, fmt::Write};
-use embassy_stm32::adc::{self, Adc};
+use embassy_stm32::adc;
 use embassy_stm32::exti::ExtiInput;
 use embassy_stm32::gpio::Pull;
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::channel::Channel;
 use embedded_graphics::text::renderer::CharacterStyle;
 use libm::*;
+
 
 use defmt::{debug, info};
 use defmt_rtt as _;
@@ -49,7 +50,7 @@ const GYRO_SCALE: f32 = 131.0; // 131 LSB per deg/s (for +/- 250 dps full scale 
 
 static CHANNEL: Channel<ThreadModeRawMutex, f32, 64> = Channel::new();
 static BUT: Channel<ThreadModeRawMutex, bool, 64> = Channel::new();
-static JOI: Channel<ThreadModeRawMutex, i8, 64> = Channel::new();
+static JOYSTICK: Channel<ThreadModeRawMutex, i8, 64> = Channel::new();
 
 fn combine_bytes(first: u8, second: u8) -> i16 {
     ((first as i16) << 8) | (second as i16)
@@ -76,16 +77,34 @@ fn display(
 }
 
 #[embassy_executor::task]
-async fn reset_btn(mut btn: ExtiInput<'static>) {
+async fn reset_btn(mut btn:ExtiInput<'static>) {
     loop {
         btn.wait_for_falling_edge().await;
         BUT.send(true).await;
         // Timer::after_millis(50).await;
+
+    }
+}
+
+#[embassy_executor::task]
+async fn control_joystick(mut adc: adc::Adc<'static, embassy_stm32::peripherals::ADC1>, mut pa_pin: embassy_stm32::peripherals::PA0) 
+{
+    adc.set_resolution(adc::Resolution::BITS14);
+    adc.set_averaging(adc::Averaging::Samples1024);
+    adc.set_sample_time(adc::SampleTime::CYCLES160_5);
+    const MAX_VALUE: u32 = adc::resolution_to_max_count(adc::Resolution::BITS14);
+
+    loop {
+        let level: u16 = adc.blocking_read(&mut pa_pin);
+        let voltage = 3.3f32 * level as f32 / MAX_VALUE as f32;
+
+        info!("voltage: {}", voltage);
     }
 }
 
 #[embassy_executor::task]
 async fn move_motor(_old_yaw: f64, mut pwm: SimplePwm<'static, embassy_stm32::peripherals::TIM1>) {
+    
     let mut ch1 = pwm.ch1();
     ch1.enable();
     loop {
@@ -137,36 +156,10 @@ fn transform(x: f32) -> f32 {
     x * 50.0 / 9.0 + 750.0
 }
 
-#[embassy_executor::task]
-async fn control_joystick(p: embassy_stm32::Peripherals) {
-    // let mut p = embassy_stm32::init(Default::default());
-
-    // Create ADC driver on ADCx
-    let mut adc = adc::Adc::new(p.ADC1);
-
-    // Configure resolution, averaging, and sample time
-    adc.set_resolution(adc::Resolution::BITS14);
-    adc.set_averaging(adc::Averaging::Samples1024);
-    adc.set_sample_time(adc::SampleTime::CYCLES160_5);
-
-    const MAX_VALUE: u32 = adc::resolution_to_max_count(adc::Resolution::BITS14);
-
-    loop {
-        // Read a raw ADC value (blocking read)
-        let level: u16 = adc.blocking_read(&mut p.PA0);
-        info!("{}", level);
-
-        // info!("Light sensor reading: {}, voltage: {}", level, voltage);
-
-        // Wait a bit before reading again
-        embassy_time::Timer::after_millis(200).await;
-    }
-}
-
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let mut config = Config::default();
-    let p = embassy_stm32::init(config);
+    // let p = embassy_stm32::init(config);
 
     //DE SCHIMBA
 
@@ -183,7 +176,7 @@ async fn main(spawner: Spawner) {
     config.rcc.voltage_range = VoltageScale::RANGE1;
     config.rcc.mux.iclksel = mux::Iclksel::HSI48;
 
-    // let p = embassy_stm32::init(config);
+    let p = embassy_stm32::init(config);
 
     let mut warning_pin = Output::new(p.PB6, Level::Low, Speed::Medium);
     let mut good_pin = Output::new(p.PB7, Level::High, Speed::Medium);
@@ -203,7 +196,7 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(move_motor(0.0, pwm)).unwrap();
     spawner.spawn(reset_btn(il_butoaine)).unwrap();
-    spawner.spawn(control_joystick(p)).unwrap();
+    spawner.spawn(control_joystick(adc::Adc::new(p.ADC1), p.PA0)).unwrap();
 
     const MIN_PERIOD_US: u32 = 500;
     const MAX_PERIOD_US: u32 = 2500;
@@ -274,12 +267,16 @@ async fn main(spawner: Spawner) {
     let mut yaw: f32 = 0.0;
     let mut last_time = Instant::now();
 
+
     // Timer::after_secs(1).await;
     let mut last_display_time = Instant::now();
 
     loop {
-        let now = Instant::now();
 
+        // Wait a bit before reading again
+        embassy_time::Timer::after_secs(1).await;
+        let now = Instant::now();
+        
         // Only update the display every 200ms (5 frames per second)
         if now.duration_since(last_display_time).as_millis() > 500 {
             display(roll, pitch, yaw, &mut screen, style);
@@ -287,28 +284,13 @@ async fn main(spawner: Spawner) {
         }
 
         // --- SPI Sensor Read ---
-        let tx_buf = [
-            (1 << 7) | REG_ADDR,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ];
+        let tx_buf = [ (1 << 7) | REG_ADDR, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 ];
         let mut rx_buf = [0u8; 15];
         sensor_spi.transfer(&mut rx_buf, &tx_buf).unwrap();
         // Read 14 consecutive bytes starting at 0x3B:
         // Accel X (1,2), Accel Y (3,4), Accel Z (5,6), Temp (7,8),
         // Gyro X (9,10), Gyro Y (11,12), Gyro Z (13,14)
+
 
         let res_x = combine_bytes(rx_buf[1], rx_buf[2]);
         let res_y = combine_bytes(rx_buf[3], rx_buf[4]);
@@ -326,11 +308,7 @@ async fn main(spawner: Spawner) {
         last_time = now;
 
         let gyro_z_dps = ((raw_gz as f32) - gyro_z_offset) / GYRO_SCALE;
-        let filtered_gz = if gyro_z_dps.abs() < 0.3 {
-            0.0
-        } else {
-            gyro_z_dps
-        };
+        let filtered_gz = if gyro_z_dps.abs() < 0.3 { 0.0 } else { gyro_z_dps };
 
         let old_yaw = yaw;
         yaw += filtered_gz * delta_t;
