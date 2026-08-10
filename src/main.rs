@@ -10,7 +10,6 @@ use embassy_sync::channel::Channel;
 use embedded_graphics::text::renderer::CharacterStyle;
 use libm::*;
 
-
 use defmt::{debug, info};
 use defmt_rtt as _;
 use embassy_embedded_hal::shared_bus::blocking::spi::SpiDeviceWithConfig;
@@ -79,15 +78,13 @@ fn display(
 }
 
 #[embassy_executor::task]
-async fn reset_btn(mut btn:ExtiInput<'static>) {
+async fn reset_btn(mut btn: ExtiInput<'static>) {
     loop {
         btn.wait_for_falling_edge().await;
         BUT.send(true).await;
         // Timer::after_millis(50).await;
-
     }
 }
-
 
 use embassy_stm32::Peri;
 use embassy_stm32::peripherals::{ADC1, PA0, PA4};
@@ -97,7 +94,6 @@ async fn control_joystick(
     mut adc: adc::Adc<'static, ADC1>,
     mut pa_pin_x: Peri<'static, PA0>,
     mut pa_pin_y: Peri<'static, PA4>,
-
 ) {
     adc.set_resolution(adc::Resolution::BITS14);
     adc.set_averaging(adc::Averaging::Samples1024);
@@ -118,28 +114,24 @@ async fn control_joystick(
 
         if level_x < 1000.0 {
             JOYSTICK.send(1.0).await;
-        } else if level_x > 6000.0 && level_x < 10000.0{
+        } else if level_x > 6000.0 && level_x < 10000.0 {
             JOYSTICK.send(-1.0).await;
         }
 
         Timer::after_millis(10).await;
 
-        if level_y < 4000.0 {
+        if level_y < 1000.0 {
             JOYSTICK2.send(1.0).await;
-        } else if level_y > 6000.0 && level_y < 14000.0{
+        } else if level_y > 6000.0 && level_y < 16000.0 {
             JOYSTICK2.send(-1.0).await;
         }
 
         Timer::after_millis(200).await;
-
-
     }
 }
 
-
 #[embassy_executor::task]
 async fn move_motor(_old_yaw: f64, mut pwm: SimplePwm<'static, embassy_stm32::peripherals::TIM1>) {
-    
     let mut ch1 = pwm.ch1();
     ch1.enable();
     loop {
@@ -150,8 +142,10 @@ async fn move_motor(_old_yaw: f64, mut pwm: SimplePwm<'static, embassy_stm32::pe
 }
 
 #[embassy_executor::task]
-async fn move_motor2(_old_yaw2: f64, mut pwm: SimplePwm<'static, embassy_stm32::peripherals::TIM3>) {
-    
+async fn move_motor2(
+    _old_yaw2: f64,
+    mut pwm: SimplePwm<'static, embassy_stm32::peripherals::TIM3>,
+) {
     let mut ch1 = pwm.ch2();
     ch1.enable();
     loop {
@@ -256,7 +250,9 @@ async fn main(spawner: Spawner) {
     spawner.spawn(move_motor(0.0, pwm)).unwrap();
     spawner.spawn(move_motor2(0.0, pwm2)).unwrap();
     spawner.spawn(reset_btn(il_butoaine)).unwrap();
-    spawner.spawn(control_joystick(adc::Adc::new(p.ADC1), p.PA0, p.PA4)).unwrap();
+    spawner
+        .spawn(control_joystick(adc::Adc::new(p.ADC1), p.PA0, p.PA4))
+        .unwrap();
 
     const MIN_PERIOD_US: u32 = 500;
     const MAX_PERIOD_US: u32 = 2500;
@@ -301,6 +297,11 @@ async fn main(spawner: Spawner) {
     sensor_spi.transfer(&mut rx_dummy, &tx_reset).unwrap();
     Timer::after_millis(100).await; // Wait for reset to finish
 
+    // STEP 2: DISABLE I2C (This stops the random 60-degree bug)
+    let tx_disable_i2c = [!(1 << 7) & 0x6A, 0x10]; // 0x6A = USER_CTRL, 0x10 = I2C_IF_DIS
+    sensor_spi.transfer(&mut rx_dummy, &tx_disable_i2c).unwrap();
+    Timer::after_millis(10).await;
+
     // MPU Init
     let tx_pwr = [!(1 << 7) & WRITE_ADDR_PWR, 0x00];
     let mut rx_dummy = [0u8; 2];
@@ -338,11 +339,10 @@ async fn main(spawner: Spawner) {
     let mut last_display_time = Instant::now();
 
     loop {
-
         // Wait a bit before reading again
         // embassy_time::Timer::after_secs(1).await;
         let now = Instant::now();
-        
+
         // Only update the display every 200ms (5 frames per second)
         if now.duration_since(last_display_time).as_millis() > 1000 {
             display(roll, pitch, yaw, &mut screen, style);
@@ -351,13 +351,28 @@ async fn main(spawner: Spawner) {
         }
 
         // --- SPI Sensor Read ---
-        let tx_buf = [ (1 << 7) | REG_ADDR, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 ];
+        let tx_buf = [
+            (1 << 7) | REG_ADDR,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
         let mut rx_buf = [0u8; 15];
         sensor_spi.transfer(&mut rx_buf, &tx_buf).unwrap();
         // Read 14 consecutive bytes starting at 0x3B:
         // Accel X (1,2), Accel Y (3,4), Accel Z (5,6), Temp (7,8),
         // Gyro X (9,10), Gyro Y (11,12), Gyro Z (13,14)
-
 
         let res_x = combine_bytes(rx_buf[1], rx_buf[2]);
         let res_y = combine_bytes(rx_buf[3], rx_buf[4]);
@@ -368,7 +383,8 @@ async fn main(spawner: Spawner) {
         let acc_y = (res_y as f32) / SCALE_F;
         let acc_z = (res_z as f32) / SCALE_F;
 
-    
+        info!("{} {} {}", acc_x, acc_y, acc_z);
+
         pitch = atan2f(acc_y, sqrtf(acc_x * acc_x + acc_z * acc_z)).to_degrees();
         roll = atan2f(-acc_x, sqrtf(acc_y * acc_y + acc_z * acc_z)).to_degrees();
         roll += rolly;
@@ -376,7 +392,11 @@ async fn main(spawner: Spawner) {
         last_time = now;
 
         let gyro_z_dps = ((raw_gz as f32) - gyro_z_offset) / GYRO_SCALE;
-        let filtered_gz = if gyro_z_dps.abs() < 0.3 { 0.0 } else { gyro_z_dps };
+        let filtered_gz = if gyro_z_dps.abs() < 0.3 {
+            0.0
+        } else {
+            gyro_z_dps
+        };
 
         let old_yaw = yaw;
         yaw += filtered_gz * delta_t;
@@ -395,12 +415,11 @@ async fn main(spawner: Spawner) {
             Ok(_v) => {
                 yaw = 0.0;
                 rolly = 0.0;
+                roll = 0.0;
                 info!("Neutralize\n\n\n\n");
             }
             _ => {}
         }
-
-        
 
         let val = JOYSTICK.try_receive();
         match val {
@@ -417,7 +436,6 @@ async fn main(spawner: Spawner) {
             }
             Err(_) => {}
         }
-
 
         old_roll = roll;
     }
