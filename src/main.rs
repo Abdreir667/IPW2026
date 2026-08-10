@@ -52,6 +52,7 @@ static CHANNEL: Channel<ThreadModeRawMutex, f32, 64> = Channel::new();
 static CHANNEL2: Channel<ThreadModeRawMutex, f32, 64> = Channel::new();
 static BUT: Channel<ThreadModeRawMutex, bool, 64> = Channel::new();
 static JOYSTICK: Channel<ThreadModeRawMutex, f32, 64> = Channel::new();
+static JOYSTICK2: Channel<ThreadModeRawMutex, f32, 64> = Channel::new();
 
 fn combine_bytes(first: u8, second: u8) -> i16 {
     ((first as i16) << 8) | (second as i16)
@@ -120,6 +121,35 @@ async fn control_joystick(
     }
 }
 
+#[embassy_executor::task]
+async fn control_joystick2(
+    mut adc: adc::Adc<'static, ADC4>,
+    mut pa_pin: Peri<'static, PA4>,
+) {
+    adc.set_resolution(adc::Resolution::BITS14);
+    adc.set_averaging(adc::Averaging::Samples1024);
+    adc.set_sample_time(adc::SampleTime::CYCLES160_5);
+
+    let zero = 8192.0;
+    let step1 = 12287.0;
+    let step_1 = 4095.0;
+    Timer::after_millis(200).await;
+
+    const MAX_VALUE: u32 = adc::resolution_to_max_count(adc::Resolution::BITS14);
+    loop {
+        let level: f64 = adc.blocking_read(&mut pa_pin) as f64;
+        let voltage = 3.3f32 * level as f32 / MAX_VALUE as f32;
+        // info!("{} {}", level, voltage);
+
+        if level < 1000.0 {
+            JOYSTICK2.send(1.0).await;
+        } else if level > 6000.0 && level < 10000.0{
+            JOYSTICK2.send(-1.0).await;
+        }
+        Timer::after_millis(100).await;
+    }
+}
+
 
 #[embassy_executor::task]
 async fn move_motor(_old_yaw: f64, mut pwm: SimplePwm<'static, embassy_stm32::peripherals::TIM1>) {
@@ -133,14 +163,15 @@ async fn move_motor(_old_yaw: f64, mut pwm: SimplePwm<'static, embassy_stm32::pe
     }
 }
 
-async fn move_motor2(_old_yaw2: f64, mut pwm: SimplePwm<'static, embassy_stm32::peripherals::TIM2>) {
+#[embassy_executor::task]
+async fn move_motor2(_old_yaw2: f64, mut pwm: SimplePwm<'static, embassy_stm32::peripherals::TIM3>) {
     
-    let mut ch1 = pwm.ch1();
+    let mut ch1 = pwm.ch2();
     ch1.enable();
     loop {
         let yaw = CHANNEL2.receive().await;
         ch1.set_duty_cycle_fraction(transform(yaw) as u16, 10_000);
-        info!("Ma misc {}", yaw);
+        // info!("Ma misc {}", yaw);
     }
 }
 
@@ -240,6 +271,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(move_motor2(0.0, pwm2)).unwrap();
     spawner.spawn(reset_btn(il_butoaine)).unwrap();
     spawner.spawn(control_joystick(adc::Adc::new(p.ADC1), p.PA0)).unwrap();
+    spawner.spawn(control_joystick2(adc::Adc::new(p.ADC4), p.PA4)).unwrap();
 
     const MIN_PERIOD_US: u32 = 500;
     const MAX_PERIOD_US: u32 = 2500;
@@ -309,7 +341,7 @@ async fn main(spawner: Spawner) {
     // --- STEP 2: STATE VARIABLES ---
     let mut yaw: f32 = 0.0;
     let mut last_time = Instant::now();
-    let old_roll = 0.0;
+    let mut old_roll = 0.0;
 
     // Timer::after_secs(1).await;
     let mut last_display_time = Instant::now();
@@ -321,8 +353,9 @@ async fn main(spawner: Spawner) {
         let now = Instant::now();
         
         // Only update the display every 200ms (5 frames per second)
-        if now.duration_since(last_display_time).as_millis() > 500 {
+        if now.duration_since(last_display_time).as_millis() > 1000 {
             display(roll, pitch, yaw, &mut screen, style);
+            CHANNEL2.send(roll).await; // Yields to move_motor
             last_display_time = now;
         }
 
@@ -358,12 +391,12 @@ async fn main(spawner: Spawner) {
         yaw += filtered_gz * delta_t;
 
         // Use absolute value to ignore massive noisy spikes, but allow normal movement
-        if (yaw - old_yaw).abs() < 1.0 {
+        if (yaw - old_yaw).abs() < 2.0 {
             CHANNEL.send(-yaw).await; // Yields to move_motor
         }
 
-        if (roll - old_roll).abs() < 1.0 {
-            CHANNEL2.send(-roll).await; // Yields to move_motor
+        if (roll - old_roll).abs() < 2.0 {
+            CHANNEL2.send(roll).await; // Yields to move_motor
         }
 
         let value = BUT.try_receive();
@@ -381,6 +414,14 @@ async fn main(spawner: Spawner) {
         match val {
             Ok(v) => {
                 yaw += 5.0 * v;
+            }
+            Err(_) => {}
+        }
+
+        let val = JOYSTICK2.try_receive();
+        match val {
+            Ok(v) => {
+                roll += 5.0 * v;
             }
             Err(_) => {}
         }
