@@ -50,7 +50,7 @@ const GYRO_SCALE: f32 = 131.0; // 131 LSB per deg/s (for +/- 250 dps full scale 
 
 static CHANNEL: Channel<ThreadModeRawMutex, f32, 64> = Channel::new();
 static BUT: Channel<ThreadModeRawMutex, bool, 64> = Channel::new();
-static JOYSTICK: Channel<ThreadModeRawMutex, i8, 64> = Channel::new();
+static JOYSTICK: Channel<ThreadModeRawMutex, f32, 64> = Channel::new();
 
 fn combine_bytes(first: u8, second: u8) -> i16 {
     ((first as i16) << 8) | (second as i16)
@@ -86,21 +86,39 @@ async fn reset_btn(mut btn:ExtiInput<'static>) {
     }
 }
 
+
+use embassy_stm32::Peri;
+use embassy_stm32::peripherals::{ADC1, PA0};
+
 #[embassy_executor::task]
-async fn control_joystick(mut adc: adc::Adc<'static, embassy_stm32::peripherals::ADC1>, mut pa_pin: embassy_stm32::peripherals::PA0) 
-{
+async fn control_joystick(
+    mut adc: adc::Adc<'static, ADC1>,
+    mut pa_pin: Peri<'static, PA0>,
+) {
     adc.set_resolution(adc::Resolution::BITS14);
     adc.set_averaging(adc::Averaging::Samples1024);
     adc.set_sample_time(adc::SampleTime::CYCLES160_5);
+
+    let zero = 8192.0;
+    let step1 = 12287.0;
+    let step_1 = 4095.0;
+    Timer::after_millis(200).await;
+
     const MAX_VALUE: u32 = adc::resolution_to_max_count(adc::Resolution::BITS14);
-
     loop {
-        let level: u16 = adc.blocking_read(&mut pa_pin);
+        let level: f64 = adc.blocking_read(&mut pa_pin) as f64;
         let voltage = 3.3f32 * level as f32 / MAX_VALUE as f32;
+        // info!("{} {}", level, voltage);
 
-        info!("voltage: {}", voltage);
+        if level < 1000.0 {
+            JOYSTICK.send(1.0).await;
+        } else if level > 6000.0 && level < 10000.0{
+            JOYSTICK.send(-1.0).await;
+        }
+        Timer::after_millis(100).await;
     }
 }
+
 
 #[embassy_executor::task]
 async fn move_motor(_old_yaw: f64, mut pwm: SimplePwm<'static, embassy_stm32::peripherals::TIM1>) {
@@ -274,7 +292,7 @@ async fn main(spawner: Spawner) {
     loop {
 
         // Wait a bit before reading again
-        embassy_time::Timer::after_secs(1).await;
+        // embassy_time::Timer::after_secs(1).await;
         let now = Instant::now();
         
         // Only update the display every 200ms (5 frames per second)
@@ -325,6 +343,14 @@ async fn main(spawner: Spawner) {
                 info!("Neutralize\n\n\n\n");
             }
             _ => {}
+        }
+
+        let val = JOYSTICK.try_receive();
+        match val {
+            Ok(v) => {
+                yaw += 5.0 * v;
+            }
+            Err(_) => {}
         }
     }
 }
