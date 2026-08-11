@@ -2,7 +2,7 @@
 #![no_main]
 
 use core::{cell::RefCell, fmt::Write};
-use embassy_stm32::adc;
+use embassy_stm32::adc::{self, Averaging, Resolution, SampleTime};
 use embassy_stm32::exti::ExtiInput;
 use embassy_stm32::gpio::Pull;
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
@@ -95,39 +95,36 @@ async fn control_joystick(
     mut pa_pin_x: Peri<'static, PA0>,
     mut pa_pin_y: Peri<'static, PA4>,
 ) {
-    adc.set_resolution(adc::Resolution::BITS14);
-    adc.set_averaging(adc::Averaging::Samples1024);
-    adc.set_sample_time(adc::SampleTime::CYCLES160_5);
+    adc.set_resolution(Resolution::BITS14);
+    adc.set_averaging(Averaging::Samples1024);
+    adc.set_sample_time(SampleTime::CYCLES160_5);
 
-    let zero = 8192.0;
-    let step1 = 12287.0;
-    let step_1 = 4095.0;
-    Timer::after_millis(200).await;
+    const MAX_VAL: u32 = adc::resolution_to_max_count(Resolution::BITS14);
 
-    const MAX_VALUE: u32 = adc::resolution_to_max_count(adc::Resolution::BITS14);
     loop {
-        let level_x: f64 = adc.blocking_read(&mut pa_pin_x) as f64;
-        // let voltage = 3.3f32 * level as f32 / MAX_VALUE as f32;
-        // info!("{} {}", level, voltage);
-        let level_y: f64 = adc.blocking_read(&mut pa_pin_y) as f64;
-        info!("Level x: {} Level y {}", level_x, level_y);
+        let val_x = adc.blocking_read(&mut pa_pin_x);
+        let perc_x = (val_x as u32 * 100 / MAX_VAL) as u8;
+        Timer::after_millis(10).await;
+        let val_y = adc.blocking_read(&mut pa_pin_y);
+        let perc_y = (val_y as u32 * 100 / MAX_VAL) as u8;
 
-        if level_x < 1000.0 {
+        // info!("{} {}", perc_x, perc_y);
+
+        if perc_x >= 60 {
             JOYSTICK.send(1.0).await;
-        } else if level_x > 6000.0 && level_x < 10000.0 {
+        } else if perc_x <= 40 {
             JOYSTICK.send(-1.0).await;
         }
 
-        Timer::after_millis(10).await;
-
-        if level_y < 1000.0 {
+        if perc_y >= 60 {
             JOYSTICK2.send(1.0).await;
-        } else if level_y > 6000.0 && level_y < 16000.0 {
+        } else if perc_y <= 40 {
             JOYSTICK2.send(-1.0).await;
         }
 
         Timer::after_millis(200).await;
     }
+
 }
 
 #[embassy_executor::task]
@@ -216,6 +213,7 @@ async fn main(spawner: Spawner) {
     config.rcc.sys = Sysclk::PLL1_R;
     config.rcc.voltage_range = VoltageScale::RANGE1;
     config.rcc.mux.iclksel = mux::Iclksel::HSI48;
+    config.rcc.mux.adcdacsel = mux::Adcdacsel::HSI;
 
     let p = embassy_stm32::init(config);
 
@@ -383,7 +381,7 @@ async fn main(spawner: Spawner) {
         let acc_y = (res_y as f32) / SCALE_F;
         let acc_z = (res_z as f32) / SCALE_F;
 
-        info!("{} {} {}", acc_x, acc_y, acc_z);
+        // info!("{} {} {}", acc_x, acc_y, acc_z);
 
         pitch = atan2f(acc_y, sqrtf(acc_x * acc_x + acc_z * acc_z)).to_degrees();
         roll = atan2f(-acc_x, sqrtf(acc_y * acc_y + acc_z * acc_z)).to_degrees();
@@ -424,6 +422,7 @@ async fn main(spawner: Spawner) {
         let val = JOYSTICK.try_receive();
         match val {
             Ok(v) => {
+                info!("Adjusting yaw");
                 yaw += 5.0 * v;
             }
             Err(_) => {}
@@ -432,6 +431,7 @@ async fn main(spawner: Spawner) {
         let val2 = JOYSTICK2.try_receive();
         match val2 {
             Ok(v) => {
+                info!("Adjusting roll");
                 rolly += 5.0 * v;
             }
             Err(_) => {}
