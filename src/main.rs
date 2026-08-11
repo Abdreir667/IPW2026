@@ -323,11 +323,15 @@ async fn main(spawner: Spawner) {
         Timer::after_millis(5).await;
     }
     let gyro_z_offset = gyro_z_sum / (samples as f32);
-    info!("Gyro Z bias offset: {}", gyro_z_offset);
+    let message= "Calibrating!";
+
+    let _ = Text::new(&message, Point::new(0, 20), style).draw(&mut screen);
+
     Timer::after_secs(1).await;
+    screen.clear(Rgb565::BLACK).unwrap();
+
     warning_pin.set_high();
     good_pin.set_low();
-    // --- STEP 2: STATE VARIABLES ---
     let mut yaw: f32 = 0.0;
     let mut last_time = Instant::now();
     let mut old_roll = 0.0;
@@ -337,18 +341,15 @@ async fn main(spawner: Spawner) {
     let mut last_display_time = Instant::now();
 
     loop {
-        // Wait a bit before reading again
-        // embassy_time::Timer::after_secs(1).await;
+  
         let now = Instant::now();
 
-        // Only update the display every 200ms (5 frames per second)
         if now.duration_since(last_display_time).as_millis() > 1000 {
             display(roll, pitch, yaw, &mut screen, style);
-            CHANNEL2.send(roll).await; // Yields to move_motor
+            CHANNEL2.send(roll).await; 
             last_display_time = now;
         }
 
-        // --- SPI Sensor Read ---
         let tx_buf = [
             (1 << 7) | REG_ADDR,
             0,
